@@ -1,0 +1,10 @@
+[target.riscv32imc-unknown-none-elf]
+runner = "espflash flash --monitor --chip esp32c3"
+# C3 是 RISC-V，backtrace 需要帧指针，否则只能看到栈转储
+rustflags = ["-C", "force-frame-pointers"]
+
+[build]
+target = "riscv32imc-unknown-none-elf"
+
+[env]
+ESP_LOG = "info"

@@ -1,0 +1,51 @@
+[package]
+name = "esp32-pir"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+
+[[bin]]
+name = "esp32-pir"
+path = "src/main.rs"
+
+[dependencies]
+# 版本基线：2026-06 在 ESP32-C3 SuperMini 上实测过的组合
+# （esp-hal ~1.1 / esp-radio 0.18 / esp-rtos 0.3 / smoltcp 0.13），
+# 不要单独升级其中一个，成套升级，升级前先查对应版本的文档。
+esp-hal = { version = "~1.1.0", features = ["esp32c3", "unstable"] }
+esp-alloc = "0.10.0"
+esp-backtrace = { version = "0.19.0", features = ["esp32c3", "panic-handler", "println"] }
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32c3"] }
+esp-println = { version = "0.17.0", features = ["esp32c3"] }
+esp-radio = { version = "0.18.0", features = [
+  "esp-alloc",
+  "esp32c3",
+  # 让 esp-radio 的 Wi-Fi 接口实现 smoltcp 的 Device trait，
+  # 这样才能把 raw smoltcp（阻塞）跑在它上面；不用 embassy-net
+  "smoltcp",
+  "unstable",
+  "wifi",
+] }
+# 注意：不要开 "embassy" feature，那是给异步用的，这个模板不用
+esp-rtos = { version = "0.3.0", features = ["esp-alloc", "esp-radio", "esp32c3"] }
+# raw smoltcp 0.13，阻塞用法；不要和 blocking-network-stack 混用
+# （那个小库是按旧版 smoltcp 写的，版本对不上）
+smoltcp = { version = "0.13.0", default-features = false, features = [
+  "medium-ethernet",
+  "proto-dhcpv4",
+  "proto-ipv4",
+  "socket-dhcpv4",
+  # UDP 和 TCP 两套都留着，切换只改 net.rs 里的 TRANSPORT
+  "socket-tcp",
+  "socket-udp",
+] }
+
+[profile.dev]
+# 调试档默认太慢太大，嵌入式上总要开一点优化
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1
+debug = 2
+lto = "fat"
+opt-level = "s"
