@@ -1,7 +1,11 @@
 [target.riscv32imc-unknown-none-elf]
 runner = "espflash flash --monitor --chip esp32c3"
 # C3 是 RISC-V，backtrace 需要帧指针，否则只能看到栈转储
-rustflags = ["-C", "force-frame-pointers"]
+# esp-hal 的标准链接参数：linkall.x 由 esp-hal 的 build 脚本生成，
+# 必须告诉链接器用它，否则链接阶段报 undefined symbol
+#（_stack_start、DefaultHandler、WIFI_BB 等）。
+# 2026-11-07 在 InstaBox 上实测：缺了这行，裸 cargo build 链接失败。
+rustflags = ["-C", "force-frame-pointers", "-C", "link-arg=-Tlinkall.x"]
 
 [build]
 target = "riscv32imc-unknown-none-elf"
