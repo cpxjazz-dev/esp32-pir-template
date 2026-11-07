@@ -20,16 +20,19 @@ esp-println = { version = "0.17.0", features = ["esp32c3"] }
 esp-radio = { version = "0.18.0", features = [
   "esp-alloc",
   "esp32c3",
-  # 让 esp-radio 的 Wi-Fi 接口实现 smoltcp 的 Device trait，
-  # 这样才能把 raw smoltcp（阻塞）跑在它上面；不用 embassy-net
-  "smoltcp",
+  # 注意：0.18 已删除 `smoltcp` feature，esp-radio 不再直接实现
+  # smoltcp 的 Device trait。net.rs 里用 Interface::receive/transmit
+  # 的 token API 自己包了一层 WifiDevice（见 net.rs 的适配注释）。
   "unstable",
   "wifi",
 ] }
 # 注意：不要开 "embassy" feature，那是给异步用的，这个模板不用
 esp-rtos = { version = "0.3.0", features = ["esp-alloc", "esp-radio", "esp32c3"] }
-# raw smoltcp 0.13，阻塞用法；不要和 blocking-network-stack 混用
-# （那个小库是按旧版 smoltcp 写的，版本对不上）
+# 只用来把 esp-radio 0.18 的 connect_async() 在阻塞代码里跑完
+# （0.18 没有同步 connect）；主循环本身仍是阻塞式的，不用 Embassy 任务
+embassy-futures = "0.1"
+# raw smoltcp 0.13，阻塞用胶水；不要和 blocking-network-stack 混用
+# （那个小包是按旧版 smoltcp 写的，版本对不上）
 smoltcp = { version = "0.13.0", default-features = false, features = [
   "medium-ethernet",
   "proto-dhcpv4",

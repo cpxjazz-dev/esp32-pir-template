@@ -79,6 +79,8 @@ fn main() -> ! {
     let mut socket_entries: [smoltcp::iface::SocketStorage<'_>; 3] = Default::default();
     let mut udp_rx_storage = [0u8; 1024];
     let mut udp_tx_storage = [0u8; 1024];
+    let mut udp_rx_metadata = [smoltcp::socket::udp::PacketMetadata::EMPTY; 16];
+    let mut udp_tx_metadata = [smoltcp::socket::udp::PacketMetadata::EMPTY; 16];
     let mut tcp_rx_storage = [0u8; 2048];
     let mut tcp_tx_storage = [0u8; 2048];
     let mut net = Net::new(
@@ -86,6 +88,8 @@ fn main() -> ! {
         &mut socket_entries,
         &mut udp_rx_storage,
         &mut udp_tx_storage,
+        &mut udp_rx_metadata,
+        &mut udp_tx_metadata,
         &mut tcp_rx_storage,
         &mut tcp_tx_storage,
     );

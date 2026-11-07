@@ -142,3 +142,4 @@ python3 test_server.py udp 9000   # 换个端口
   `count` 从 0 开始会被误判为迟到的旧包扔掉，已修成 120 秒超时重置
 - 2026-11-05：TCP 和 UDP 两套都保留，改 `TRANSPORT` 一行切换，
   默认 UDP；`tools/test_server.py` 支持 `udp` / `tcp` 两种模式
+- 2026-11-07：在 InstaBox 免费机（Rust 1.99.1）上跑通 `cargo check`，按 esp-radio 0.18 / smoltcp 0.13.1 的真实 API 修了三轮：① 删 esp-radio 的 `smoltcp` feature（0.18 已删），net.rs 用 Interface 的 token API 自己包了一层 WifiDevice 实现 smoltcp Device；`PowerSaveMode::MinModem` → `Minimum`；删 `controller.start()`；`connect()` → `block_on(connect_async())`；`is_connected()` 按 bool 处理；② `udp::SocketBuffer` → `udp::PacketBuffer`、`SocketSet::new` 改传切片、TCP connect 补 `iface.context()`；③ UDP 的 `PacketBuffer::new` 需元数据+载荷两个缓冲，main.rs 加 `udp_rx_metadata` / `udp_tx_metadata`（各 16 个 `PacketMetadata::EMPTY`）。另加 `embassy-futures = "0.1"`（只用来跑 connect_async）和 `Cargo.lock`（锁定通过 check 的版本）。注意：check 通过但有 3 个 warning，其中 `wait_for_high` / `wait_for_low` 是 async 方法、直接调用不会等待（esp-hal 1.x 的 API 形态），真机上要确认是否需要 block_on。
