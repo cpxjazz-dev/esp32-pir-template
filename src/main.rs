@@ -104,9 +104,12 @@ fn main() -> ! {
 
     let mut count: u32 = 0;
     loop {
-        // 阻塞等红外变高。esp-rtos 是抢占式的，射频 blob 照常跑，
-        // 不会因为主循环堵在这里就饿死。
-        pir.wait_for_high();
+        // 阻塞等红外变高。esp-hal 1.x 的 wait_for_high() 是 async 方法，
+        // 没有阻塞版；直接调只会造出一个立即丢弃的 Future，等于没等。
+        // 用 embassy-futures 的 block_on 在当前线程把它跑完（net.rs 里
+        // 连 Wi-Fi 也是这么包的）。block_on 是忙轮询，esp-rtos 是抢占式
+        // 的，射频 blob 照常跑，不会因为主循环堵在这里就饿死。
+        embassy_futures::block_on(pir.wait_for_high());
         count += 1;
         println!("Motion #{} detected", count);
 
@@ -115,7 +118,7 @@ fn main() -> ! {
 
         // HC-SR501 触发后输出会保持高电平几秒：等它落下再加一点
         // 保护间隔，避免一个人走过连发多条。
-        pir.wait_for_low();
+        embassy_futures::block_on(pir.wait_for_low());
         delay.delay_millis(REARM_GUARD_MS);
     }
 }
