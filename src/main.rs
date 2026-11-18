@@ -75,14 +75,17 @@ fn main() -> ! {
     let device = interfaces.station;
 
     // 联网状态：接口、设备、套接字集合都在 Net 里
-    // （UDP 和 TCP 两套都建了，切换只改 net.rs 里的 TRANSPORT）
-    let mut socket_entries: [smoltcp::iface::SocketStorage<'_>; 3] = Default::default();
+    // （UDP、TCP 和 ntfy 三套都建了，切换只改 net.rs 里的 TRANSPORT）
+    let mut socket_entries: [smoltcp::iface::SocketStorage<'_>; 4] = Default::default();
     let mut udp_rx_storage = [0u8; 1024];
     let mut udp_tx_storage = [0u8; 1024];
     let mut udp_rx_metadata = [smoltcp::socket::udp::PacketMetadata::EMPTY; 16];
     let mut udp_tx_metadata = [smoltcp::socket::udp::PacketMetadata::EMPTY; 16];
     let mut tcp_rx_storage = [0u8; 2048];
     let mut tcp_tx_storage = [0u8; 2048];
+    // DNS 查询槽位：一次只查一个域名，2 个槽够用（Option 默认是 None，
+    // 不用真的构造 DnsQuery）。
+    let mut dns_queries: [Option<smoltcp::socket::dns::DnsQuery>; 2] = Default::default();
     let mut net = Net::new(
         device,
         &mut socket_entries,
@@ -92,6 +95,8 @@ fn main() -> ! {
         &mut udp_tx_metadata,
         &mut tcp_rx_storage,
         &mut tcp_tx_storage,
+        &mut dns_queries as &mut [Option<smoltcp::socket::dns::DnsQuery>],
+        delay,
     );
 
     Net::configure_wifi(&mut wifi_controller);

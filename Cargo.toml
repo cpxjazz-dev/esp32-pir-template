@@ -38,10 +38,19 @@ smoltcp = { version = "0.13.0", default-features = false, features = [
   "proto-dhcpv4",
   "proto-ipv4",
   "socket-dhcpv4",
+  # DNS 解析（ntfy 通道要用域名）：socket-dns 只多拉一个 proto-dns，
+  # 不用 alloc；查询槽位由调用方在 main.rs 里给数组。
+  "socket-dns",
   # UDP 和 TCP 两套都留着，切换只改 net.rs 里的 TRANSPORT
   "socket-tcp",
   "socket-udp",
 ] }
+# ntfy 通道（Transport::Ntfy）：阻塞式 HTTPS 客户端，走 TLS 1.3。
+# git 依赖，rev 钉在 2026-11-18 的 HEAD，和模板的基线一起升级。
+smoltcp-http-client = { git = "https://github.com/cpxjazz-dev/smoltcp-http-client", rev = "2c04554edd5bba249a2fc4a40b7f1688e9c02ea4", features = ["tls"] }
+# HwRng 要给 embedded-tls 0.19（rand_core 0.6）实现 CryptoRng。
+# esp-hal 的 Rng 只实现了 RngCore，没实现 CryptoRng，见 net.rs。
+rand_core = { version = "0.6", default-features = false }
 
 [profile.dev]
 # 调试档默认太慢太大，嵌入式上总要开一点优化

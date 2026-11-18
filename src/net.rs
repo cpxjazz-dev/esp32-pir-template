@@ -4,29 +4,41 @@
 //! 每一层都得自己搭：Wi-Fi 连接、DHCP 拿 IP、发包。
 //! 代码量全在这里，主程序 `main.rs` 只剩红外逻辑，看着就短了。
 //!
-//! 上报有两套，切换只要改 `TRANSPORT` 这一行：
+//! 上报有三套，切换只要改 `TRANSPORT` 这一行：
 //!   - UDP：一条数据包发出去就行，不用建连、不用等响应，
 //!     一次触发连发 10 次（间隔 0.5 秒），接收端按 count 去重，
 //!     10 次里收到 1 次就算成功。代码短，适合局域网里的自建接收端。
 //!   - TCP+HTTP：`POST /motion` 发一条 JSON，有连接、有响应确认，
 //!     适合接收端是现成 HTTP 服务（比如家里的服务器、webhook）的
 //!     情况。代码长不少，但不用接收端自己写去重。
+//!   - ntfy：第一次推送前 DNS 解析出 ntfy 服务器的 IP 并缓存起来，
+//!     之后每次推送直接用缓存的 IP（DNS 的时间成本每次上电只付一次）；
+//!     只有推送在连接层失败时才清掉缓存、下次推送重新解析
+//!     （应对 Cloudflare 换 IP）。用 `smoltcp-http-client`
+//!     走 TLS 1.3 `POST /motion`，Bearer token 认证，
+//!     手机上的 ntfy 应用直接收到推送。不经过任何中转，
+//!     板子直连 ntfy 服务器。
 
 use alloc::format;
 use alloc::string::ToString;
 use esp_hal::delay::Delay;
+use esp_hal::rng::Rng as EspRng;
 use esp_hal::time::{Duration, Instant};
 use esp_println::println;
 use esp_radio::wifi::{sta::StationConfig, Config, Interface as WifiInterface, PowerSaveMode, WifiController};
+use rand_core::{CryptoRng, Error as RandError, RngCore};
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::phy::{
     Device as SmolDevice, DeviceCapabilities, Medium, RxToken as SmolRxToken, TxToken as SmolTxToken,
 };
 use smoltcp::socket::dhcpv4;
+use smoltcp::socket::dns;
 use smoltcp::socket::tcp;
 use smoltcp::socket::udp;
 use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
+use smoltcp::wire::{DnsQueryType, EthernetAddress, HardwareAddress, IpAddress, IpCidr};
+use smoltcp_http_client::tls::TLS_RECORD_BUFFER_SIZE;
+use smoltcp_http_client::{Error as HttpError, HttpClient, Request, TcpTransport, TlsOptions};
 
 extern crate alloc;
 
@@ -50,13 +62,35 @@ const BURST_INTERVAL_MS: u32 = 500;
 /// UDP 版的本地端口（固定一个就行，不用随机端口）
 const LOCAL_PORT: u16 = 49152;
 
+/// ntfy 服务器：域名、端口、topic 路径。
+/// 注意：URL 里写 IP（smoltcp-http-client 没有 DNS），
+/// server_name 写域名（SNI + 证书主机名校验），两者是两回事；
+/// IP 由下面的 resolve() 每次上报前现解析。
+const NTFY_HOST: &str = "ntfy-jagfm94g-cpxjazz-dev.cloady.io";
+const NTFY_PORT: u16 = 443;
+const NTFY_PATH: &str = "/motion";
+/// ntfy 的 Bearer token：编译时用环境变量传入，不要写死提交。
+/// 这个 token 是只对 motion topic 只写的普通用户（非 admin），
+/// 泄露了也只能往这一个 topic 发消息。
+const NTFY_TOKEN: &str = env!("NTFY_TOKEN");
+/// ISRG Root X1（Let's Encrypt 根证书，DER，2035 年到期）。
+/// ntfy 服务器的证书链是 leaf ← YE2 ← Root YE ← ISRG Root X2
+/// ← ISRG Root X1，根就是 ISRG Root X1（2026-11-18 在 InstaBox
+/// 上用 openssl 验过链，也和官网下载的 DER 逐字节对过）。
+const NTFY_CA_DER: &[u8] = include_bytes!("../assets/isrg-root-x1.der");
+/// DHCP 没给 DNS 服务器时 fallback 到这个。
+const DNS_FALLBACK: IpAddress = IpAddress::v4(8, 8, 8, 8);
+/// 一次 DNS 查询最多等多久。
+const DNS_TIMEOUT_MS: u64 = 5_000;
+
 // ================= 联网状态 =================
 
-/// 上报走 UDP 还是 TCP+HTTP
+/// 上报走 UDP、TCP+HTTP 还是 ntfy
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
     Udp,
     Tcp,
+    Ntfy,
 }
 
 // ================= smoltcp 设备适配 =================
@@ -139,18 +173,32 @@ pub struct Net<'a> {
     dhcp_handle: SocketHandle,
     udp_handle: SocketHandle,
     tcp_handle: SocketHandle,
+    dns_handle: SocketHandle,
+    /// DHCP 给的 DNS 服务器（一般是路由器）；没给就是 None，
+    /// 解析时 fallback 到 8.8.8.8。
+    dns_server: Option<IpAddress>,
+    /// ntfy 服务器的 IP 缓存：第一次推送前 DNS 解析一次存下来，
+    /// 之后推送直接用它，不再解析；推送在连接层失败时清掉，
+    /// 下次推送重新解析（应对 Cloudflare 换 IP）。
+    /// None = 还没解析过（或已被清掉）。
+    ntfy_ip: Option<IpAddress>,
+    /// TcpTransport::delay_ms 要用，存在 Net 里（Delay 是单位结构体，
+    /// Copy，传值进来 main() 那边还能继续用自己的那份）。
+    delay: Delay,
 }
 
 impl<'a> Net<'a> {
     pub fn new(
         device: WifiInterface<'static>,
-        socket_entries: &'a mut [SocketStorage<'a>; 3],
+        socket_entries: &'a mut [SocketStorage<'a>; 4],
         udp_rx_storage: &'a mut [u8],
         udp_tx_storage: &'a mut [u8],
         udp_rx_metadata: &'a mut [udp::PacketMetadata],
         udp_tx_metadata: &'a mut [udp::PacketMetadata],
         tcp_rx_storage: &'a mut [u8],
         tcp_tx_storage: &'a mut [u8],
+        dns_queries: &'a mut [Option<dns::DnsQuery>],
+        delay: Delay,
     ) -> Self {
         // 注意：这里直接把 &'a mut 交过去，不要再 &mut [..] 重借，
         // 否则生命周期会被缩短，SocketSet 就拿不到 'a。
@@ -167,6 +215,10 @@ impl<'a> Net<'a> {
             tcp::SocketBuffer::new(tcp_rx_storage),
             tcp::SocketBuffer::new(tcp_tx_storage),
         ));
+        // DNS 套接字：查询槽位借自 main() 的数组（2 个槽，一次只查一个，
+        // 够用）。服务器列表现在还不知道（DHCP 没跑），先传空，
+        // obtain_ip() 拿到 DHCP 的 dns_servers 后再 update_servers()。
+        let dns_handle = sockets.add(dns::Socket::new(&[], dns_queries));
 
         let mac = device.mac_address();
         let mut device = WifiDevice::new(device);
@@ -183,6 +235,10 @@ impl<'a> Net<'a> {
             dhcp_handle,
             udp_handle,
             tcp_handle,
+            dns_handle,
+            dns_server: None,
+            ntfy_ip: None,
+            delay,
         };
 
         // UDP 发包前要先 bind 一个本地端口，绑一次就行；
@@ -272,6 +328,18 @@ impl<'a> Net<'a> {
                             .add_default_ipv4_route(router)
                             .unwrap();
                     }
+                    // DHCP 一般还会给 DNS 服务器（通常是路由器）；
+                    // 没给的话 dns_server 保持 None，解析时用 8.8.8.8。
+                    // 注意：smoltcp 0.13 的 DNS_MAX_SERVER_COUNT = 1，
+                    // update_servers() 只留第一个，多了会截断。
+                    if let Some(dns) = config.dns_servers.first() {
+                        let server = IpAddress::Ipv4(*dns);
+                        println!("DHCP: dns server={:?}", server);
+                        self.dns_server = Some(server);
+                        self.sockets
+                            .get_mut::<dns::Socket>(self.dns_handle)
+                            .update_servers(&[server]);
+                    }
                     return;
                 }
             }
@@ -280,12 +348,149 @@ impl<'a> Net<'a> {
         }
     }
 
-    /// 上报一次触发，按 TRANSPORT 走 UDP 或 TCP。
+    /// 上报一次触发，按 TRANSPORT 走 UDP、TCP 或 ntfy。
     /// 失败只打印日志，不 panic，下次触发再试。
     pub fn send_notification(&mut self, count: u32, delay: &Delay) {
         match TRANSPORT {
             Transport::Udp => self.send_udp(count, delay),
             Transport::Tcp => self.send_tcp(count, delay),
+            Transport::Ntfy => self.send_ntfy(count, delay),
+        }
+    }
+
+    /// 把域名解析成 IPv4（只查 A 记录）。
+    /// 服务器用 DHCP 给的 DNS，没给就用 8.8.8.8。
+    /// 失败只打印日志、返回 None，不 panic。
+    fn resolve(&mut self, hostname: &str, delay: &Delay) -> Option<IpAddress> {
+        let server = self.dns_server.unwrap_or(DNS_FALLBACK);
+        self.sockets
+            .get_mut::<dns::Socket>(self.dns_handle)
+            .update_servers(&[server]);
+
+        let handle = match self.sockets.get_mut::<dns::Socket>(self.dns_handle).start_query(
+            self.iface.context(),
+            hostname,
+            DnsQueryType::A,
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                println!("DNS start_query({}) error: {:?}", hostname, e);
+                return None;
+            }
+        };
+
+        let deadline = Instant::now() + Duration::from_millis(DNS_TIMEOUT_MS);
+        loop {
+            self.iface
+                .poll(smol_timestamp(), &mut self.device, &mut self.sockets);
+            match self
+                .sockets
+                .get_mut::<dns::Socket>(self.dns_handle)
+                .get_query_result(handle)
+            {
+                Ok(addrs) => {
+                    // DNS_MAX_RESULT_COUNT = 1，最多回来 1 条；
+                    // A 查询只会返回 IPv4，直接取第一条。
+                    let ip = addrs.first().copied();
+                    println!("DNS {} -> {:?}", hostname, ip);
+                    return ip;
+                }
+                Err(dns::GetQueryResultError::Pending) => {}
+                Err(dns::GetQueryResultError::Failed) => {
+                    println!("DNS query({}) failed", hostname);
+                    return None;
+                }
+            }
+            if Instant::now() > deadline {
+                println!("DNS query({}) timed out", hostname);
+                self.sockets
+                    .get_mut::<dns::Socket>(self.dns_handle)
+                    .cancel_query(handle);
+                return None;
+            }
+            delay.delay_millis(10);
+        }
+    }
+
+    /// ntfy 服务器的 IP（带缓存）：有缓存直接用，没有就 DNS 解析一次
+    /// 存下来。解析失败返回 None，不 panic——调用方跳过本次推送，
+    /// 下次触发再解析。
+    fn ntfy_ip(&mut self, delay: &Delay) -> Option<IpAddress> {
+        if let Some(ip) = self.ntfy_ip {
+            return Some(ip);
+        }
+        let ip = self.resolve(NTFY_HOST, delay)?;
+        self.ntfy_ip = Some(ip);
+        Some(ip)
+    }
+
+    /// ntfy 版：用缓存的 ntfy 服务器 IP（第一次推送前 DNS 解析一次），
+    /// 再用 smoltcp-http-client 走 TLS 1.3 POST /motion。
+    /// 一次触发只发一次；失败只打印日志，不 panic，下次触发再试。
+    /// 推送在连接层失败（连不上、握手失败等）时清掉 IP 缓存，
+    /// 下次推送重新解析；服务端正常回了响应（哪怕是 4xx/5xx）
+    /// 说明 IP 是通的，不清缓存。
+    ///
+    /// 注意：URL 里写解析出的 IP（crate 没有 DNS），
+    /// server_name 写域名（SNI + 证书主机名校验）。
+    fn send_ntfy(&mut self, count: u32, delay: &Delay) {
+        // IP 有缓存直接用，没有才解析一次（每次上电只付一次 DNS 时间）。
+        let Some(ip) = self.ntfy_ip(delay) else {
+            println!("ntfy: DNS resolve failed, skipping");
+            return;
+        };
+        let url = format!("https://{}:{}{}", ip, NTFY_PORT, NTFY_PATH);
+        let body = format!("Motion #{} detected", count);
+        let auth = format!("Bearer {}", NTFY_TOKEN);
+
+        // TLS 记录缓冲：两个 8 KiB。
+        // 放堆上，不放栈上：main 任务的栈本来已经放了套接字缓冲，
+        // 再加 16 KiB 有溢出的风险；堆是 128 KiB，Wi-Fi 约占 50~60 KiB，
+        // 握手时再加这两个缓冲约 16 KiB + 零星分配，够用。
+        // 注意：vec! 是直接在堆上分配再填充，不会先在栈上造一个大数组。
+        let mut read_buf = alloc::vec![0u8; TLS_RECORD_BUFFER_SIZE];
+        let mut write_buf = alloc::vec![0u8; TLS_RECORD_BUFFER_SIZE];
+        let mut hw_rng = HwRng(EspRng::new());
+
+        let mut client = HttpClient::new(&mut *self);
+        let req = Request::post(&url, "text/plain", body.as_bytes())
+            .header("Authorization", &auth)
+            .header("Title", "有人经过");
+        let tls_opts = TlsOptions {
+            server_name: NTFY_HOST,
+            ca_der: NTFY_CA_DER,
+            rng: &mut hw_rng,
+            read_buffer: &mut read_buf,
+            write_buffer: &mut write_buf,
+        };
+        match client.request_tls(&req, tls_opts) {
+            Ok(resp) => {
+                println!(
+                    "ntfy POST ok: status={} body={}",
+                    resp.status,
+                    resp.body_str().unwrap_or("<non-utf8>")
+                );
+            }
+            Err(e) => {
+                println!("ntfy POST failed: {}", e);
+                // 连接层失败（连不上 / 握手失败 / 收发失败 / 超时）：
+                // 可能是缓存的 IP 已过期（Cloudflare 换 IP），清掉缓存，
+                // 下次推送重新解析。服务端已经回了响应的错误
+                //（InvalidResponse / BodyTooLarge 等）说明 IP 是通的，
+                // 不清缓存。
+                if matches!(
+                    e,
+                    HttpError::Connect
+                        | HttpError::ConnectTimeout
+                        | HttpError::Send
+                        | HttpError::Recv
+                        | HttpError::ResponseTimeout
+                        | HttpError::Tls(_)
+                ) {
+                    self.ntfy_ip = None;
+                    println!("ntfy: connection failed, cached IP cleared, will re-resolve next push");
+                }
+            }
         }
     }
 
@@ -434,6 +639,96 @@ impl<'a> Net<'a> {
         }
     }
 }
+
+// ================= 给 Net 实现 TcpTransport，HttpClient 就能用了 =================
+//
+// 只是把 Net 里现成的 smoltcp 操作透传出来（和
+// smoltcp-http-client 的 examples/post_json.rs 里的做法一样）。
+
+impl TcpTransport for Net<'_> {
+    fn now_ms(&mut self) -> u64 {
+        Instant::now().duration_since_epoch().as_millis() as u64
+    }
+
+    fn poll(&mut self) {
+        self.iface
+            .poll(smol_timestamp(), &mut self.device, &mut self.sockets);
+    }
+
+    fn delay_ms(&mut self, ms: u32) {
+        self.delay.delay_millis(ms);
+    }
+
+    fn connect(&mut self, remote: (IpAddress, u16), local_port: u16) -> Result<(), HttpError> {
+        let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
+        socket
+            .connect(self.iface.context(), remote, local_port)
+            .map_err(|_| HttpError::Connect)
+    }
+
+    fn send(&mut self, data: &[u8]) -> Result<usize, HttpError> {
+        let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
+        socket.send_slice(data).map_err(|_| HttpError::Send)
+    }
+
+    fn recv(&mut self, buf: &mut [u8]) -> Result<usize, HttpError> {
+        let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
+        socket.recv_slice(buf).map_err(|_| HttpError::Recv)
+    }
+
+    fn may_send(&mut self) -> bool {
+        self.sockets.get_mut::<tcp::Socket>(self.tcp_handle).may_send()
+    }
+
+    fn can_recv(&mut self) -> bool {
+        self.sockets.get_mut::<tcp::Socket>(self.tcp_handle).can_recv()
+    }
+
+    fn may_recv(&mut self) -> bool {
+        self.sockets.get_mut::<tcp::Socket>(self.tcp_handle).may_recv()
+    }
+
+    fn close(&mut self) {
+        let socket = self.sockets.get_mut::<tcp::Socket>(self.tcp_handle);
+        let _ = socket.close();
+    }
+
+    fn abort(&mut self) {
+        self.sockets.get_mut::<tcp::Socket>(self.tcp_handle).abort();
+    }
+}
+
+/// 硬件随机数：esp-hal 的 Rng 只实现了 rand_core 0.6 的 RngCore，
+/// 没实现 CryptoRng，不能直接给 TlsOptions 用（embedded-tls 0.19
+/// 要的是 RngCore + CryptoRng）。包一层 newtype 转发即可：
+/// 底层熵源还是片上硬件 RNG（和 smoltcp-http-client 的
+/// post_json_tls 例子里的做法一样；esp-hal 1.1 的 Rng::new()
+/// 不取外设参数，RNG 是单例，直接 new）。
+pub struct HwRng(EspRng);
+
+impl RngCore for HwRng {
+    fn next_u32(&mut self) -> u32 {
+        self.0.random()
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        ((self.0.random() as u64) << 32) | (self.0.random() as u64)
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        for chunk in dest.chunks_mut(4) {
+            let word = self.0.random().to_le_bytes();
+            chunk.copy_from_slice(&word[..chunk.len()]);
+        }
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), RandError> {
+        self.fill_bytes(dest);
+        Ok(())
+    }
+}
+
+impl CryptoRng for HwRng {}
 
 /// 把 esp-hal 的时间转成 smoltcp 的时间
 fn smol_timestamp() -> SmolInstant {
